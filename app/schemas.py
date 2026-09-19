@@ -2,15 +2,18 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _NAME_MAX = 200
 _NONCE_MAX = 256
 _CODE_MAX = 128
+_TOKEN_MAX = 256
 _OFFER_TTL_MAX = 7 * 24 * 3600  # 邀约有效期上限：7 天
+_WITNESS_MIN = 2
+_WITNESS_MAX = 5
 
 
 def _validate_name(value: str, field: str) -> str:
@@ -35,6 +38,15 @@ def _validate_code(value: str) -> str:
         raise ValueError("confirmation_code 不能为空（一次性确认码）")
     if len(value) > _CODE_MAX:
         raise ValueError(f"confirmation_code 长度不能超过 {_CODE_MAX}")
+    return value
+
+
+def _validate_token(value: str) -> str:
+    value = value.strip()
+    if not value:
+        raise ValueError("token 不能为空（见证人一次性令牌）")
+    if len(value) > _TOKEN_MAX:
+        raise ValueError(f"token 长度不能超过 {_TOKEN_MAX}")
     return value
 
 
@@ -145,6 +157,27 @@ class VerifyResult(BaseModel):
     stored_tail_hash: Optional[str] = None
 
 
+class WitnessInput(BaseModel):
+    name: str = Field(..., description="见证人标识")
+    token: str = Field(
+        ...,
+        description=(
+            "该见证人的独立一次性令牌（表态凭证，明文仅在创建响应中返回一次，"
+            "服务端只保存其 SHA-256 摘要）"
+        ),
+    )
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, v: str) -> str:
+        return _validate_name(v, "witness name")
+
+    @field_validator("token")
+    @classmethod
+    def _check_token(cls, v: str) -> str:
+        return _validate_token(v)
+
+
 class OfferCreateRequest(BaseModel):
     chain_id: str = Field(..., description="交接链 ID")
     tail_hash: str = Field(..., description="发起邀约时锁定的当前链尾哈希")
@@ -154,6 +187,21 @@ class OfferCreateRequest(BaseModel):
     )
     confirmation_code: str = Field(
         ..., description="一次性确认码，服务端只保存其 SHA-256 摘要"
+    )
+    witnesses: Optional[list[WitnessInput]] = Field(
+        default=None,
+        description=(
+            "见证人列表（2～5 名，各持独立一次性令牌）；"
+            "省略或为空则创建兼容旧行为的无见证邀约"
+        ),
+    )
+    witness_threshold: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description=(
+            "见证通过阈值：接收方确认时同意数须达到该值且无拒绝；"
+            "提供见证人时必填，合法范围 1～见证人数量（上限 5）"
+        ),
     )
 
     @field_validator("chain_id")
@@ -179,6 +227,41 @@ class OfferCreateRequest(BaseModel):
     def _check_confirmation_code(cls, v: str) -> str:
         return _validate_code(v)
 
+    @model_validator(mode="after")
+    def _check_witnesses(self) -> "OfferCreateRequest":
+        witnesses = self.witnesses or []
+        if not witnesses:
+            # 无见证邀约：阈值必须缺省
+            if self.witness_threshold is not None:
+                raise ValueError("无见证人时不能设置 witness_threshold")
+            return self
+
+        if not (_WITNESS_MIN <= len(witnesses) <= _WITNESS_MAX):
+            raise ValueError(
+                f"见证人数量必须在 {_WITNESS_MIN}～{_WITNESS_MAX} 名之间"
+            )
+        if self.witness_threshold is None:
+            raise ValueError("见证邀约必须提供 witness_threshold")
+        if not (1 <= self.witness_threshold <= len(witnesses)):
+            raise ValueError("witness_threshold 必须在 1～见证人数量之间")
+
+        names = [w.name for w in witnesses]
+        if len(set(names)) != len(names):
+            raise ValueError("见证人名称不能重复")
+        tokens = [w.token for w in witnesses]
+        if len(set(tokens)) != len(tokens):
+            raise ValueError("见证人令牌不能重复")
+        return self
+
+
+class WitnessCreatedOut(BaseModel):
+    witness_index: int = Field(..., description="见证人次序号（0 起，按提交顺序）")
+    name: str
+    token: str = Field(
+        ...,
+        description="该见证人的一次性令牌明文（仅此一次返回，服务端不存明文）",
+    )
+
 
 class OfferOut(BaseModel):
     offer_id: str
@@ -187,6 +270,17 @@ class OfferOut(BaseModel):
     status: str = Field(..., description="邀约状态：pending / accepted / expired")
     expires_at: str
     created_at: str
+    witness_mode: bool = Field(
+        default=False,
+        description="是否见证确认模式（无见证邀约恒为 false）",
+    )
+    witness_threshold: Optional[int] = Field(
+        default=None, description="见证通过阈值；无见证邀约为 null"
+    )
+    witnesses: list[WitnessCreatedOut] = Field(
+        default_factory=list,
+        description="见证人及其一次性令牌明文（仅创建响应返回）",
+    )
 
 
 class OfferConfirmRequest(BaseModel):
@@ -198,12 +292,26 @@ class OfferConfirmRequest(BaseModel):
         return _validate_code(v)
 
 
+class WitnessStateOut(BaseModel):
+    witness_index: int
+    name: str
+    decision: Optional[Literal["approved", "rejected"]] = Field(
+        None, description="表态结果：approved（同意）/ rejected（拒绝）/ null（未表态）"
+    )
+    decided_at: Optional[str] = None
+
+
 class OfferStatusOut(BaseModel):
     offer_id: str
     chain_id: str
     receiver: str
     status: str = Field(
-        ..., description="pending（待确认）/ accepted（已确认）/ expired（已过期，派生状态）"
+        ...,
+        description=(
+            "pending（待确认）/ accepted（已确认）/ expired（已过期，派生）/ "
+            "rejected（见证模式下有见证人拒绝，派生）/ "
+            "terminated（链尾已推进，派生）"
+        ),
     )
     expires_at: str
     created_at: str
@@ -211,6 +319,73 @@ class OfferStatusOut(BaseModel):
     accepted_seq: Optional[int] = Field(
         None, description="确认后追加的移交事件序号；未确认时为 null"
     )
+    witness_mode: bool = False
+    witness_threshold: Optional[int] = Field(
+        None, description="见证通过阈值；无见证邀约为 null"
+    )
+    witness_count: int = Field(
+        0, description="见证人总数（无见证邀约为 0）"
+    )
+    approved_count: int = Field(0, description="已同意的见证人数")
+    rejected_count: int = Field(0, description="已拒绝的见证人数")
+    pending_count: int = Field(0, description="尚未表态的见证人数")
+    witnesses: list[WitnessStateOut] = Field(
+        default_factory=list,
+        description="各见证人的表态状态，不含令牌及其摘要",
+    )
+
+
+class WitnessStatusOut(BaseModel):
+    offer_id: str
+    witness_mode: bool = Field(
+        ..., description="固定为 true；对无见证邀约查询返回 404"
+    )
+    status: str = Field(
+        ...,
+        description=(
+            "邀约派生状态：pending / accepted / expired / rejected / terminated"
+        ),
+    )
+    witness_threshold: int = Field(..., description="通过所需同意数")
+    witness_count: int
+    approved_count: int
+    rejected_count: int
+    pending_count: int
+    witnesses: list[WitnessStateOut] = Field(
+        ..., description="各见证人表态状态，绝不含令牌摘要"
+    )
+
+
+class WitnessDecisionRequest(BaseModel):
+    token: str = Field(
+        ..., description="创建邀约时由服务端分发的该见证人独立一次性令牌"
+    )
+    decision: Literal["approved", "rejected"] = Field(
+        ..., description="表态：approved（同意）或 rejected（拒绝）"
+    )
+
+    @field_validator("token")
+    @classmethod
+    def _check_token(cls, v: str) -> str:
+        return _validate_token(v)
+
+
+class WitnessDecisionResult(BaseModel):
+    offer_id: str
+    witness_index: int
+    name: str
+    decision: Literal["approved", "rejected"]
+    decided_at: str
+    status: str = Field(
+        ...,
+        description=(
+            "表态后邀约派生状态：pending（仍可继续表态/确认）/ rejected（已有拒绝）"
+        ),
+    )
+    witness_threshold: int
+    approved_count: int
+    rejected_count: int
+    pending_count: int
 
 
 class OfferConfirmResult(BaseModel):

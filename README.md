@@ -37,8 +37,27 @@
      链尾已推进（`tail_mismatch`）均返回 409 且不写任何事件**；
      确认码错误返回 **403**（`code_mismatch`）。
   3. **查询邀约** `GET /offers/{offer_id}`：返回邀约状态
-     （`pending` / `accepted` / `expired`，过期为派生状态）与确认结果，
-     不含确认码及其摘要。
+     （`pending` / `accepted` / `expired` / `terminated`，后两者为派生状态）
+     与确认结果，不含确认码及其摘要。
+- **见证确认（可选模式）**：发起邀约时可附带 2～5 名见证人及通过阈值
+  `witness_threshold`（1～见证人数量），其余流程与普通邀约一致：
+  1. 发起邀约时每个见证人提交 `name` 与一个**互相独立的一次性令牌** `token`。
+     服务端只保存「绑定 offer_id 做域分隔」的 **SHA-256 令牌摘要**，明文仅在
+     创建响应中返回一次，由发起方线下分发。
+  2. **见证人表态** `POST /offers/{offer_id}/witness-decisions`：凭令牌表态
+     `approved`（同意）或 `rejected`（拒绝）。令牌错误返回 **403**
+     （`token_mismatch`）；令牌命中即作废，同一见证人重复表态返回 **409**
+     （`witness_already_decided`）。
+  3. 接收方确认时，服务端在**同一个 SQLite 立即事务**内于原有校验之后再校验
+     「**无见证人拒绝** 且 **同意数达到阈值**」：有拒绝返回 **409**
+     （`offer_rejected`），同意数不足返回 **409**
+     （`witness_threshold_not_met`），均**不写任何事件**。
+  4. **任一拒绝**即令邀约进入 `rejected` 终止态；**过期**、**链尾被其他移交
+     推进**（状态派生为 `terminated`）同样终止，终止后表态与确认均返回 409
+     且不写事件。
+  5. **见证状态查询** `GET /offers/{offer_id}/witnesses`：返回各见证人的名称、
+     序号、表态结果与同意/拒绝/待表态计数及派生邀约状态，**绝不返回令牌及其
+     摘要**（`GET /offers/{offer_id}` 的邀约详情同样只给统计与表态结果）。
 - **完整性校验**：服务端从创世记录起逐条重算哈希、校验序号连续性与 `prev_hash`
   指针，并比对链尾缓存；校验结果给出 **首个断裂序号 `first_broken_seq`**。
 
@@ -82,18 +101,26 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | --- | --- | --- |
 | `POST` | `/chains` | 创建交接链（文件摘要 + 首位持有人） |
 | `POST` | `/handovers` | 执行一次移交（链尾哈希 + 接收方 + 一次性随机数） |
-| `POST` | `/offers` | 发起待接收移交邀约（链尾 + 接收方 + 有效期 + 一次性确认码，只存摘要） |
-| `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认邀约，原子追加移交事件 |
-| `GET`  | `/offers/{offer_id}` | 查询单个邀约状态（pending / accepted / expired） |
+| `POST` | `/offers` | 发起邀约（链尾 + 接收方 + 有效期 + 一次性确认码；可选 2～5 名见证人与阈值） |
+| `POST` | `/offers/{offer_id}/confirm` | 接收方凭确认码确认，原子追加移交事件（见证模式须无拒绝且同意数达阈值） |
+| `POST` | `/offers/{offer_id}/witness-decisions` | 见证人凭独立一次性令牌表态同意 / 拒绝（每人至多一次） |
+| `GET`  | `/offers/{offer_id}/witnesses` | 查询见证表态状态与计数（不含令牌摘要；无见证邀约 404） |
+| `GET`  | `/offers/{offer_id}` | 查询单个邀约状态（pending / accepted / expired / rejected / terminated） |
 | `GET`  | `/chains` | 列出全部链条 |
 | `GET`  | `/chains/{chain_id}` | 查询链条与全部事件 |
 | `GET`  | `/chains/{chain_id}/verify` | 完整性校验，指出首个断裂序号 |
 | `GET`  | `/health` | 健康检查 |
 
 错误响应统一为：`{"error": "<code>", "detail": "<说明>"}`。状态码约定：
-**409** —— `tail_mismatch`（链尾不匹配/已推进）、`nonce_replay`（随机数重放）、
-`offer_expired`（邀约已过期）、`offer_already_accepted`（邀约重复确认）；
-**403** —— `code_mismatch`（确认码错误）；**404** —— 链条或邀约不存在。
+**409** —— `tail_mismatch`（链尾不匹配/已推进，邀约派生状态为 `terminated`）、
+`nonce_replay`（随机数重放）、`offer_expired`（邀约已过期）、
+`offer_already_accepted`（邀约重复确认 / 已接受后继续表态）、
+`offer_rejected`（已有见证人拒绝，邀约终止）、
+`witness_threshold_not_met`（同意数未达阈值）、
+`witness_already_decided`（见证人已表态，令牌不可重复使用）、
+`offer_not_witnessed`（对无见证邀约调用表态接口）；
+**403** —— `code_mismatch`（确认码错误）、`token_mismatch`（见证人令牌错误）；
+**404** —— 链条、邀约不存在，或对无见证邀约查询 `witness_mode_not_found`。
 
 ## 使用示例
 
@@ -151,8 +178,55 @@ curl -s -X POST http://localhost:8000/offers/7c4e.../confirm \
 #    过期 → 409 offer_expired；期间链尾被其他移交推进 → 409 tail_mismatch；
 #    以上均不写任何事件
 
-# 4) 查询邀约状态（pending / accepted / expired）
+# 4) 查询邀约状态（pending / accepted / expired / rejected / terminated）
 curl -s http://localhost:8000/offers/7c4e...
+```
+
+### 见证确认示例
+
+```bash
+# 1) alice 发起见证邀约：3 名见证人（各持独立令牌），阈值 2
+curl -s -X POST http://localhost:8000/offers \
+  -H 'Content-Type: application/json' \
+  -d '{"chain_id":"ab12...","tail_hash":"<当前链尾>","receiver":"bob",
+       "expires_in_seconds":3600,"confirmation_code":"s3cret",
+       "witness_threshold":2,
+       "witnesses":[
+         {"name":"carol","token":"tok-carol-001"},
+         {"name":"dave","token":"tok-dave-002"},
+         {"name":"erin","token":"tok-erin-003"}]}'
+# 响应（令牌明文仅此一次返回，服务端只存摘要）：
+# {"offer_id":"9d1a...","status":"pending","witness_mode":true,
+#  "witness_threshold":2,
+#  "witnesses":[{"witness_index":0,"name":"carol","token":"tok-carol-001"}, ...]}
+
+# 2) 各见证人凭自己的令牌表态（同意 / 拒绝）
+curl -s -X POST http://localhost:8000/offers/9d1a.../witness-decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"tok-carol-001","decision":"approved"}'
+# {"witness_index":0,"name":"carol","decision":"approved",
+#  "status":"pending","approved_count":1,"rejected_count":0,"pending_count":2, ...}
+
+# 3) 同意数未达阈值时接收方确认 -> 409 witness_threshold_not_met，不写事件
+#    任一见证人拒绝 -> 邀约即终止：确认返回 409 offer_rejected，不写事件
+#    同一令牌再表态 -> 409 witness_already_decided；令牌错误 -> 403 token_mismatch
+
+# 4) 第二名见证人同意，同意数达到阈值 2 且无拒绝 -> bob 确认，原子追加事件
+curl -s -X POST http://localhost:8000/offers/9d1a.../witness-decisions \
+  -H 'Content-Type: application/json' \
+  -d '{"token":"tok-dave-002","decision":"approved"}'
+curl -s -X POST http://localhost:8000/offers/9d1a.../confirm \
+  -H 'Content-Type: application/json' \
+  -d '{"confirmation_code":"s3cret"}'
+
+# 5) 查询见证状态（响应不含令牌及其摘要）
+curl -s http://localhost:8000/offers/9d1a.../witnesses
+# {"offer_id":"9d1a...","witness_mode":true,"status":"accepted",
+#  "witness_threshold":2,"witness_count":3,
+#  "approved_count":2,"rejected_count":0,"pending_count":1,
+#  "witnesses":[{"witness_index":0,"name":"carol","decision":"approved","decided_at":"..."},
+#               {"witness_index":1,"name":"dave","decision":"approved","decided_at":"..."},
+#               {"witness_index":2,"name":"erin","decision":null,"decided_at":null}]}
 ```
 
 校验响应示例（正常）：
@@ -177,14 +251,19 @@ curl -s http://localhost:8000/offers/7c4e...
 
 1. 每次追加都在 `BEGIN IMMEDIATE` 事务内完成，且进程内写操作由互斥锁串行化；
    「读链尾 → 比对 → 插入 → 推进」是一个原子步骤。邀约确认同样如此：
-   「验码 → 未过期 → 未使用 → 链尾匹配 → 追加事件 → 置 accepted」
-   全部在同一立即事务内，任一校验失败即整体回滚。
+   「验码 → 未过期 → 未使用 → 链尾匹配 → （见证模式）无拒绝且同意数达阈值
+   → 追加事件 → 置 accepted」全部在同一立即事务内，任一校验失败即整体回滚。
+   见证人表态的「按令牌摘要定位见证人 → 查未表态 → 写入 decision」也在同一
+   立即事务内串行完成，同一令牌并发表态最多一次成功。
 2. 数据库层设有 `UNIQUE(chain_id, seq)` 与 `UNIQUE(chain_id, nonce)` 唯一约束
    作为兜底，任何竞争写入都无法产生重号事件或重放随机数；邀约确认使用
-   派生随机数 `offer:<offer_id>`，同一邀约并发确认最多成功一次。
+   派生随机数 `offer:<offer_id>`，同一邀约并发确认最多成功一次。见证人表设有
+   `UNIQUE(offer_id, witness_index)` 与 `UNIQUE(offer_id, token_digest)`，
+   且表态以「行已存在 decision」判定一次性，重复使用令牌不可能产生第二条表态。
 3. WAL 日志模式 + busy timeout，兼顾读写并发与单写入者语义。
 4. 数据库初始化（`init_db`）全部使用 `CREATE ... IF NOT EXISTS`，可重复执行；
-   对已有数据文件只做增量补表（含新增的 `offers` 表），存量数据不受影响。
+   对已有数据文件只做增量补表（含 `offers`、`offer_witnesses` 表）与补列
+   （为旧版 `offers` 增补 `witness_threshold` 列），存量数据不受影响。
 
 ## 项目结构
 
@@ -193,7 +272,7 @@ curl -s http://localhost:8000/offers/7c4e...
 ├── app/
 │   ├── main.py        # FastAPI 路由与启动
 │   ├── service.py     # 哈希链核心逻辑（创建 / 追加 / 邀约确认 / 查询 / 校验）
-│   ├── database.py    # SQLite 连接、建表（chains / events / offers）与串行写事务
+│   ├── database.py    # SQLite 连接、建表（chains / events / offers / offer_witnesses）与串行写事务
 │   ├── hashing.py     # 紧凑 JSON 规范与 SHA-256
 │   ├── schemas.py     # Pydantic 请求/响应模型
 │   └── config.py      # 路径与端口配置
