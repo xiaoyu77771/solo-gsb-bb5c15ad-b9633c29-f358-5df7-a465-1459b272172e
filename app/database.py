@@ -1,11 +1,15 @@
 """SQLite 持久化层。
 
-三张表：
+四张表：
 - chains：链条头信息与链尾缓存（tail_hash / current_holder 是事件表的可信投影）
 - events：链上的全部事件，序号 0 为创世记录（文件摘要 + 首位持有人），
   序号 >=1 为移交记录。
 - offers：待接收移交邀约。只保存一次性确认码的 SHA-256 摘要（code_digest），
   不保存明文；tail_hash 记录邀约发起时锁定的链尾，确认时必须仍然匹配。
+  witness_threshold 为 NULL 表示无见证邀约（兼容旧数据），否则为见证通过阈值。
+- offer_witnesses：见证确认模式下的见证人登记与表态。只保存一次性令牌的
+  SHA-256 摘要（token_digest），不保存明文；decision 为 NULL 表示未表态，
+  同一见证人（offer_id, witness）只有一行，表态只能写入一次。
 
 防分叉保障：
 1. 所有写操作在进程内串行锁 + SQLite `BEGIN IMMEDIATE` 中完成，
@@ -74,7 +78,25 @@ CREATE TABLE IF NOT EXISTS offers (
 
 CREATE INDEX IF NOT EXISTS idx_offers_chain
     ON offers(chain_id);
+
+CREATE TABLE IF NOT EXISTS offer_witnesses (
+    offer_id      TEXT NOT NULL,
+    witness       TEXT NOT NULL,
+    token_digest  TEXT NOT NULL,
+    decision      TEXT,
+    decided_at    TEXT,
+    PRIMARY KEY (offer_id, witness),
+    UNIQUE (offer_id, token_digest),
+    CHECK(decision IS NULL OR decision IN ('approve', 'reject')),
+    FOREIGN KEY(offer_id) REFERENCES offers(offer_id)
+);
 """
+
+# 存量库的增量列迁移：CREATE TABLE IF NOT EXISTS 管不到已存在的 offers 表。
+# (表名, 列名, ADD COLUMN 子句)
+_MIGRATIONS = (
+    ("offers", "witness_threshold", "witness_threshold INTEGER"),
+)
 
 
 def _connect() -> sqlite3.Connection:
@@ -100,11 +122,20 @@ def _get_conn() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对存量数据库补充新列（幂等：已存在则跳过）。"""
+    for table, column, ddl in _MIGRATIONS:
+        cols = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+
+
 def init_db() -> None:
     """初始化（或校验）数据库结构。可重复执行。"""
     config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     with _get_conn() as conn:
         conn.executescript(_SCHEMA)
+        _migrate(conn)
 
 
 @contextmanager

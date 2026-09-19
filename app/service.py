@@ -18,9 +18,14 @@
 ----------------------
 1. 持有人以最新 tail_hash 发起邀约（指定 receiver、有效期、一次性确认码），
    服务端只保存确认码摘要并返回 offer_id；
-2. 接收方凭 offer_id + 确认码确认：在同一 SQLite 立即事务中校验邀约
-   未过期、未使用且链尾仍匹配，然后追加唯一移交事件并将邀约置为 accepted；
-3. 过期、重复确认或链尾已推进均返回 409 且不写事件。
+   可选“见证确认”模式：同时登记 2~5 名见证人（各自独立的一次性令牌，
+   同样只存摘要）与通过阈值 witness_threshold；
+2. 见证人凭令牌表态同意 / 拒绝（同一见证人只能表态一次）；
+   任一见证人拒绝即终止邀约（派生状态 rejected）；
+3. 接收方凭 offer_id + 确认码确认：在同一 SQLite 立即事务中校验邀约
+   未过期、未使用、（见证模式下）同意数达阈值且无拒绝、链尾仍匹配，
+   然后追加唯一移交事件并将邀约置为 accepted；
+4. 过期、重复确认、见证拒绝、同意数不足或链尾已推进均返回 409 且不写事件。
 """
 from __future__ import annotations
 
@@ -58,6 +63,11 @@ def _parse_ts(value: str) -> datetime:
 def _code_digest(code: str) -> str:
     """一次性确认码的存储摘要：带域分隔的 SHA-256，绝不落库明文。"""
     return digest_hex(f"offer-code:{code}")
+
+
+def _token_digest(token: str) -> str:
+    """见证人一次性令牌的存储摘要：带域分隔的 SHA-256，绝不落库明文。"""
+    return digest_hex(f"witness-token:{token}")
 
 
 def _genesis_payload(file_hash: str, holder: str) -> dict[str, Any]:
@@ -246,23 +256,68 @@ def append_handover(
     return result
 
 
-def _row_to_offer(row: sqlite3.Row, now: Optional[datetime] = None) -> dict[str, Any]:
-    """邀约行 -> 对外字典。expired 是派生状态：pending 且当前时间已过有效期。"""
-    status = row["status"]
-    if status == "pending":
-        now = now or _now_dt()
-        if now > _parse_ts(row["expires_at"]):
-            status = "expired"
+def _witness_stats_tx(conn: sqlite3.Connection, offer_id: str) -> dict[str, int]:
+    """在事务内统计某邀约的见证表态（同意 / 拒绝 / 总数）。"""
+    row = conn.execute(
+        """SELECT
+               COALESCE(SUM(CASE WHEN decision = 'approve' THEN 1 ELSE 0 END), 0)
+                   AS approvals,
+               COALESCE(SUM(CASE WHEN decision = 'reject' THEN 1 ELSE 0 END), 0)
+                   AS rejections,
+               COUNT(*) AS total
+           FROM offer_witnesses WHERE offer_id = ?""",
+        (offer_id,),
+    ).fetchone()
     return {
+        "approvals": row["approvals"],
+        "rejections": row["rejections"],
+        "total": row["total"],
+    }
+
+
+def _derive_status(
+    offer: sqlite3.Row,
+    stats: Optional[dict[str, int]] = None,
+    now: Optional[datetime] = None,
+) -> str:
+    """邀约的对外状态。expired / rejected 都是派生状态，不落库：
+
+    - rejected：已有见证人拒绝（邀约即刻终止，优先于 expired 展示）；
+    - expired：pending 且当前时间已过有效期。
+    """
+    status = offer["status"]
+    if status == "pending":
+        if stats is not None and stats["rejections"] > 0:
+            return "rejected"
+        now = now or _now_dt()
+        if now > _parse_ts(offer["expires_at"]):
+            return "expired"
+    return status
+
+
+def _row_to_offer(
+    row: sqlite3.Row,
+    now: Optional[datetime] = None,
+    stats: Optional[dict[str, int]] = None,
+) -> dict[str, Any]:
+    """邀约行 -> 对外字典。不含确认码摘要，也不含任何见证令牌摘要。"""
+    result = {
         "offer_id": row["offer_id"],
         "chain_id": row["chain_id"],
         "receiver": row["receiver"],
-        "status": status,
+        "status": _derive_status(row, stats, now),
         "expires_at": row["expires_at"],
         "created_at": row["created_at"],
         "accepted_at": row["accepted_at"],
         "accepted_seq": row["accepted_seq"],
+        "witness_threshold": row["witness_threshold"],
+        "approvals": None,
+        "rejections": None,
     }
+    if row["witness_threshold"] is not None and stats is not None:
+        result["approvals"] = stats["approvals"]
+        result["rejections"] = stats["rejections"]
+    return result
 
 
 def create_offer(
@@ -271,12 +326,34 @@ def create_offer(
     receiver: str,
     expires_in_seconds: int,
     confirmation_code: str,
+    witnesses: Optional[list[tuple[str, str]]] = None,
+    witness_threshold: Optional[int] = None,
 ) -> dict[str, Any]:
     """发起待接收移交邀约。
 
     以当前链尾 tail_hash 锁定邀约：链尾不匹配（链条已推进）返回 409，
     邀约创建即无意义。确认码只保存 SHA-256 摘要，明文不落库。
+
+    见证确认模式（可选）：witnesses 为 (见证人标识, 一次性令牌) 列表，
+    2~5 名，配合通过阈值 witness_threshold；令牌同样只存摘要。
+    两者必须同时提供或同时缺省（缺省即无见证邀约，行为与旧版一致）。
     """
+    if (witnesses is None) != (witness_threshold is None):
+        raise ChainError(
+            400, "invalid_witness_config", "见证人列表与通过阈值必须同时提供"
+        )
+    if witnesses is not None:
+        if not 2 <= len(witnesses) <= 5:
+            raise ChainError(
+                400, "invalid_witness_config", "见证人数量必须在 2~5 之间"
+            )
+        if not 1 <= witness_threshold <= len(witnesses):
+            raise ChainError(
+                400,
+                "invalid_witness_config",
+                "通过阈值必须在 1 与见证人数量之间",
+            )
+
     with write_tx() as conn:
         chain = conn.execute(
             "SELECT * FROM chains WHERE chain_id = ?", (chain_id,)
@@ -301,11 +378,28 @@ def create_offer(
         conn.execute(
             """INSERT INTO offers
                (offer_id, chain_id, tail_hash, receiver, code_digest,
-                status, expires_at, created_at)
-               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)""",
+                status, expires_at, created_at, witness_threshold)
+               VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)""",
             (offer_id, chain_id, tail_hash, receiver,
-             _code_digest(confirmation_code), expires_at, created_at),
+             _code_digest(confirmation_code), expires_at, created_at,
+             witness_threshold),
         )
+        if witnesses:
+            try:
+                conn.executemany(
+                    """INSERT INTO offer_witnesses
+                       (offer_id, witness, token_digest)
+                       VALUES (?, ?, ?)""",
+                    [
+                        (offer_id, name, _token_digest(token))
+                        for name, token in witnesses
+                    ],
+                )
+            except sqlite3.IntegrityError as exc:
+                # UNIQUE(offer_id, witness) / UNIQUE(offer_id, token_digest) 兜底
+                raise ChainError(
+                    409, "conflict", f"见证人登记冲突（标识或令牌重复）: {exc}"
+                ) from exc
 
     return {
         "offer_id": offer_id,
@@ -314,6 +408,8 @@ def create_offer(
         "status": "pending",
         "expires_at": expires_at,
         "created_at": created_at,
+        "witness_threshold": witness_threshold,
+        "witness_count": len(witnesses) if witnesses else 0,
     }
 
 
@@ -321,9 +417,11 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
     """接收方凭 offer_id + 确认码确认邀约，追加唯一移交事件。
 
     所有校验与写入在同一个 SQLite 立即事务（BEGIN IMMEDIATE）中完成：
-    校验确认码摘要 -> 邀约未过期 -> 邀约未使用 -> 链尾仍匹配，
+    校验确认码摘要 -> 邀约未过期 -> 邀约未使用
+    ->（见证模式）无见证人拒绝且同意数达阈值 -> 链尾仍匹配，
     然后追加移交事件、推进链头并将邀约置为 accepted，整体原子提交。
-    过期、重复确认、链尾已推进均返回 409 且整体回滚，不写任何事件。
+    过期、重复确认、见证拒绝、同意数不足、链尾已推进均返回 409
+    且整体回滚，不写任何事件。
     """
     with write_tx() as conn:
         offer = conn.execute(
@@ -344,6 +442,21 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
             raise ChainError(
                 409, "offer_already_accepted", "邀约已被确认，不能重复使用"
             )
+
+        # 见证闸门：任一拒绝即终止；同意数未达阈值不得确认。均无事件写入。
+        if offer["witness_threshold"] is not None:
+            stats = _witness_stats_tx(conn, offer_id)
+            if stats["rejections"] > 0:
+                raise ChainError(
+                    409, "offer_rejected", "已有见证人拒绝，邀约已终止，不能确认"
+                )
+            if stats["approvals"] < offer["witness_threshold"]:
+                raise ChainError(
+                    409,
+                    "witness_quorum_not_met",
+                    "见证同意数不足："
+                    f"{stats['approvals']}/{offer['witness_threshold']}，暂不能确认",
+                )
 
         chain = conn.execute(
             "SELECT * FROM chains WHERE chain_id = ?", (offer["chain_id"],)
@@ -376,14 +489,138 @@ def confirm_offer(offer_id: str, confirmation_code: str) -> dict[str, Any]:
 
 
 def get_offer(offer_id: str) -> dict[str, Any]:
-    """查询单个邀约状态（不返回确认码及其摘要）。"""
+    """查询单个邀约状态（不返回确认码及见证令牌的任何摘要）。"""
     with read_tx() as conn:
         row = conn.execute(
             "SELECT * FROM offers WHERE offer_id = ?", (offer_id,)
         ).fetchone()
-    if row is None:
-        raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
-    return _row_to_offer(row)
+        if row is None:
+            raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+        stats = (
+            _witness_stats_tx(conn, offer_id)
+            if row["witness_threshold"] is not None
+            else None
+        )
+    return _row_to_offer(row, stats=stats)
+
+
+def witness_vote(offer_id: str, token: str, decision: str) -> dict[str, Any]:
+    """见证人凭一次性令牌表态（approve / reject）。
+
+    与邀约确认共用同一套串行写事务：邀约必须仍处于 pending、未过期、
+    链尾未推进且尚无其他见证人拒绝；按令牌摘要定位见证人，
+    同一见证人只能表态一次（decision 已非空即拒绝重复表态）。
+    已接受 / 已过期 / 已被拒绝 / 链尾已推进的邀约均返回 409，表态不落库。
+    """
+    with write_tx() as conn:
+        offer = conn.execute(
+            "SELECT * FROM offers WHERE offer_id = ?", (offer_id,)
+        ).fetchone()
+        if offer is None:
+            raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+
+        if offer["status"] != "pending":
+            raise ChainError(
+                409, "offer_already_accepted", "邀约已被确认，见证表态不再受理"
+            )
+
+        if _now_dt() > _parse_ts(offer["expires_at"]):
+            raise ChainError(
+                409, "offer_expired", "邀约已过期，见证表态不再受理"
+            )
+
+        chain = conn.execute(
+            "SELECT tail_hash FROM chains WHERE chain_id = ?",
+            (offer["chain_id"],),
+        ).fetchone()
+        if chain is None:  # 外键约束下理论上不可达
+            raise ChainError(404, "not_found", f"链条不存在: {offer['chain_id']}")
+        if chain["tail_hash"] != offer["tail_hash"]:
+            raise ChainError(
+                409,
+                "tail_mismatch",
+                "链尾已推进：邀约已终止，见证表态不再受理",
+            )
+
+        stats = _witness_stats_tx(conn, offer_id)
+        if stats["rejections"] > 0:
+            raise ChainError(
+                409, "offer_rejected", "已有见证人拒绝，邀约已终止，表态不再受理"
+            )
+
+        row = conn.execute(
+            """SELECT witness, decision FROM offer_witnesses
+               WHERE offer_id = ? AND token_digest = ?""",
+            (offer_id, _token_digest(token)),
+        ).fetchone()
+        if row is None:
+            raise ChainError(403, "token_mismatch", "见证令牌不正确")
+        if row["decision"] is not None:
+            raise ChainError(
+                409,
+                "witness_already_decided",
+                "该见证人已表态，同一见证人只能表态一次",
+            )
+
+        decided_at = _now()
+        conn.execute(
+            """UPDATE offer_witnesses
+               SET decision = ?, decided_at = ?
+               WHERE offer_id = ? AND witness = ?""",
+            (decision, decided_at, offer_id, row["witness"]),
+        )
+        if decision == "approve":
+            stats["approvals"] += 1
+        else:
+            stats["rejections"] += 1
+
+    return {
+        "offer_id": offer_id,
+        "witness": row["witness"],
+        "decision": decision,
+        "decided_at": decided_at,
+        "witness_threshold": offer["witness_threshold"],
+        "approvals": stats["approvals"],
+        "rejections": stats["rejections"],
+        "offer_status": "rejected" if decision == "reject" else "pending",
+    }
+
+
+def get_witness_status(offer_id: str) -> dict[str, Any]:
+    """见证状态查询：只返回见证人标识与表态结果，绝不返回令牌摘要。"""
+    with read_tx() as conn:
+        offer = conn.execute(
+            "SELECT * FROM offers WHERE offer_id = ?", (offer_id,)
+        ).fetchone()
+        if offer is None:
+            raise ChainError(404, "not_found", f"邀约不存在: {offer_id}")
+        rows = conn.execute(
+            """SELECT witness, decision, decided_at FROM offer_witnesses
+               WHERE offer_id = ? ORDER BY rowid""",
+            (offer_id,),
+        ).fetchall()
+        stats = _witness_stats_tx(conn, offer_id)
+
+    threshold = offer["witness_threshold"]
+    return {
+        "offer_id": offer_id,
+        "offer_status": _derive_status(offer, stats),
+        "witness_threshold": threshold,
+        "approvals": stats["approvals"],
+        "rejections": stats["rejections"],
+        "pending_count": stats["total"] - stats["approvals"] - stats["rejections"],
+        "quorum_reached": (
+            stats["approvals"] >= threshold if threshold is not None else None
+        ),
+        "witnesses": [
+            {
+                "witness": r["witness"],
+                "decision": r["decision"] or "pending",
+                "decided_at": r["decided_at"],
+            }
+            for r in rows
+        ],
+    }
 
 
 def get_chain(chain_id: str) -> dict[str, Any]:

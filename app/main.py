@@ -20,6 +20,9 @@ from .schemas import (
     OfferOut,
     OfferStatusOut,
     VerifyResult,
+    WitnessStatusOut,
+    WitnessVoteRequest,
+    WitnessVoteResult,
 )
 from .service import (
     ChainError,
@@ -29,8 +32,10 @@ from .service import (
     create_offer,
     get_chain,
     get_offer,
+    get_witness_status,
     list_chains,
     verify_chain,
+    witness_vote,
 )
 
 
@@ -43,8 +48,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文件交接留痕服务",
-    description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验。",
-    version="1.0.0",
+    description="基于 SHA-256 哈希链的多人文件交接记录、查询与完整性校验，支持见证确认邀约。",
+    version="1.1.0",
     lifespan=lifespan,
 )
 
@@ -100,6 +105,8 @@ def api_handover(req: HandoverRequest) -> HandoverResult:
     description=(
         "以最新链尾 tail_hash 锁定邀约，指定 receiver、有效期（秒）与一次性确认码。"
         "服务端只保存确认码的 SHA-256 摘要，返回 offer_id 供接收方确认。"
+        "可选见证确认模式：提交 2~5 名见证人（各自独立的一次性令牌，同样只存摘要）"
+        "与通过阈值 witness_threshold；确认时须同意数达阈值且无拒绝。"
     ),
 )
 def api_create_offer(req: OfferCreateRequest) -> OfferOut:
@@ -110,6 +117,12 @@ def api_create_offer(req: OfferCreateRequest) -> OfferOut:
             req.receiver,
             req.expires_in_seconds,
             req.confirmation_code,
+            (
+                [(w.name, w.token) for w in req.witnesses]
+                if req.witnesses is not None
+                else None
+            ),
+            req.witness_threshold,
         )
     )
 
@@ -122,12 +135,42 @@ def api_create_offer(req: OfferCreateRequest) -> OfferOut:
     summary="确认邀约（原子追加移交事件）",
     description=(
         "接收方凭 offer_id 与一次性确认码确认。服务端在同一 SQLite 立即事务中校验"
-        "邀约未过期、未使用且链尾仍匹配，再追加唯一移交事件并将邀约置为 accepted。"
-        "过期、重复确认或链尾已推进均返回 409，不写事件。"
+        "邀约未过期、未使用、（见证模式下）见证同意数达阈值且无拒绝、链尾仍匹配，"
+        "再追加唯一移交事件并将邀约置为 accepted。"
+        "过期、重复确认、见证拒绝、同意数不足或链尾已推进均返回 409，不写事件。"
     ),
 )
 def api_confirm_offer(offer_id: str, req: OfferConfirmRequest) -> OfferConfirmResult:
     return OfferConfirmResult(**confirm_offer(offer_id, req.confirmation_code))
+
+
+@app.post(
+    "/offers/{offer_id}/witnesses",
+    response_model=WitnessVoteResult,
+    status_code=201,
+    tags=["offers"],
+    summary="见证人表态（同意 / 拒绝）",
+    description=(
+        "见证人凭独立一次性令牌表态，令牌只存 SHA-256 摘要，同一见证人只能表态一次。"
+        "邀约已接受、已过期、已被其他见证人拒绝或链尾已推进时返回 409，表态不落库。"
+    ),
+)
+def api_witness_vote(offer_id: str, req: WitnessVoteRequest) -> WitnessVoteResult:
+    return WitnessVoteResult(**witness_vote(offer_id, req.token, req.decision))
+
+
+@app.get(
+    "/offers/{offer_id}/witnesses",
+    response_model=WitnessStatusOut,
+    tags=["offers"],
+    summary="查询见证状态",
+    description=(
+        "返回见证通过阈值、各见证人表态（pending / approve / reject）与统计，"
+        "不含令牌及其摘要。"
+    ),
+)
+def api_get_witnesses(offer_id: str) -> WitnessStatusOut:
+    return WitnessStatusOut(**get_witness_status(offer_id))
 
 
 @app.get(
@@ -135,7 +178,10 @@ def api_confirm_offer(offer_id: str, req: OfferConfirmRequest) -> OfferConfirmRe
     response_model=OfferStatusOut,
     tags=["offers"],
     summary="查询单个邀约状态",
-    description="返回邀约状态（pending / accepted / expired）与确认结果，不含确认码及其摘要。",
+    description=(
+        "返回邀约状态（pending / accepted / expired / rejected）与确认结果，"
+        "见证模式下附带通过阈值与表态统计；不含确认码、令牌及其摘要。"
+    ),
 )
 def api_get_offer(offer_id: str) -> OfferStatusOut:
     return OfferStatusOut(**get_offer(offer_id))
